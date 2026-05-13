@@ -26,6 +26,20 @@ arcpy.AddMessage("Processing...")
 
 If Chinese output is needed (warnings, messages), use `unichr()` to construct at runtime. See `references/encoding-guide.md` for the character table and patterns.
 
+### sys.getfilesystemencoding() Trap
+
+ArcGIS 10.2 embedded Python reports `sys.getfilesystemencoding()` as `'ascii'` (NOT `None`).  The common `or 'mbcs'` fallback does NOT trigger because `'ascii'` is truthy.
+
+```python
+# BROKEN — 'ascii' is truthy, fallback never activates
+_SYS_ENC = sys.getfilesystemencoding() or 'mbcs'  # stays 'ascii'
+
+# CORRECT — explicit check for ASCII
+_SYS_ENC = sys.getfilesystemencoding()
+if not _SYS_ENC or _SYS_ENC.lower() in ('ascii', 'us-ascii', 'ansi_x3.4-1968'):
+    _SYS_ENC = 'mbcs'
+```
+
 ## Tool Type Selection
 
 | Factor | .pyt (Python Toolbox) | .tbx + .py script |
@@ -45,6 +59,16 @@ If Chinese output is needed (warnings, messages), use `unichr()` to construct at
 - User wants Chinese UI → .tbx + .py (GUI setup)
 - User needs `GPValueTable` with FeatureLayer columns → .tbx (required)
 - .py source for .tbx MUST be pure ASCII (same GBK constraint for embedding)
+
+### .tbx Script Caching Warning
+
+**ArcGIS .tbx embeds a copy of the script content.**  Editing the external .py file does NOT update the tool automatically.  After every edit to the .py file, you MUST re-select it in ArcCatalog:
+
+1. Right-click the tool → Properties → Script tab
+2. Re-browse and select the .py file again
+3. Click OK
+
+A debug `arcpy.AddMessage(...)` at the top of the script helps verify the new version is loaded.
 
 ## .pyt Template (from official docs)
 
@@ -101,16 +125,22 @@ class Tool(object):
 
 ## .py Script Template (for .tbx script tool)
 
+This template includes all necessary encoding helpers and the encoding-safety guard.  Use this as the starting point for any .tbx script tool.
+
 ```python
 # -*- coding: utf-8 -*-
 import arcpy
+import os
 import sys
 
+# ---- encoding (MUST use this exact guard) ----
 _SYS_ENC = sys.getfilesystemencoding()
+if not _SYS_ENC or _SYS_ENC.lower() in ('ascii', 'us-ascii', 'ansi_x3.4-1968'):
+    _SYS_ENC = 'mbcs'
 
 
 def _to_uni(val):
-    """Safe conversion to unicode — arcpy da cursors expect unicode."""
+    """Normalize arcpy value to unicode."""
     if val is None:
         return u""
     if isinstance(val, unicode):
@@ -119,34 +149,62 @@ def _to_uni(val):
         try:
             return val.decode(_SYS_ENC)
         except Exception:
-            return val.decode("utf-8", "replace")
+            try:
+                return val.decode("utf-8")
+            except Exception:
+                return val.decode("utf-8", "replace")
     return unicode(val)
 
 
+def _to_sys(val):
+    """Encode unicode to system str (for arcpy function arguments)."""
+    if isinstance(val, unicode):
+        try:
+            return val.encode(_SYS_ENC)
+        except Exception:
+            return val.encode("utf-8")
+    return str(val) if val is not None else ""
+
+
+def _msg(msg):
+    """Encode message to system str (for arcpy.AddMessage/AddError/AddWarning)."""
+    if isinstance(msg, unicode):
+        try:
+            return msg.encode(_SYS_ENC)
+        except Exception:
+            return msg.encode("utf-8")
+    return msg if isinstance(msg, str) else str(msg)
+
+
+# ---- Message constants (u"" prefix is REQUIRED) ----
+M_SEP = u"=" * 60
+
+# ---- init cleanup vars before try (avoid NameError in finally) ----
+temp_fcs = []
+
 try:
-    # Read parameters (order matches .tbx tool config)
+    # Read parameters -> unicode
+    param0 = _to_uni(arcpy.GetParameterAsText(0))
+
+    # Environment
     arcpy.env.overwriteOutput = True
 
-    param0 = _to_uni(arcpy.GetParameterAsText(0))
-    # ...
+    # All messages via _msg(); all arcpy args via _to_sys()
+    arcpy.AddMessage(_msg(M_SEP))
 
-    # Use unicode for all arcpy data
-    with arcpy.da.SearchCursor(fc, ["OID@", "FieldName", "SHAPE@XY"]) as cursor:
-        for row in cursor:
-            fld = _to_uni(row[1])
-
-    # Write back — assign unicode, not GBK str
-    with arcpy.da.UpdateCursor(fc, ["OID@", "TargetField"]) as cursor:
-        for row in cursor:
-            row[1] = unicode_value
-            cursor.updateRow(row)
-
-    # Use u"" for all format strings with unicode data
-    arcpy.AddMessage(u"Done. {} features.".format(count))
-
+except arcpy.ExecuteError:
+    arcpy.AddError(_msg(u"Erase Error: ") + arcpy.GetMessages(2))
+    raise SystemExit
 except Exception as e:
-    arcpy.AddError("Error: " + repr(e))
-    raise
+    arcpy.AddError(_msg(u"Unexpected Error: {0}".format(repr(e))))
+    raise SystemExit
+finally:
+    for temp_fc in temp_fcs:
+        try:
+            if arcpy.Exists(_to_sys(temp_fc)):
+                arcpy.Delete_management(_to_sys(temp_fc))
+        except Exception:
+            pass
 ```
 
 ## Key Patterns
@@ -155,19 +213,55 @@ except Exception as e:
 
 `arcpy.GetParameterAsText()` and cursor values may return GBK `str` or `unicode`. Normalize immediately.
 
-### 2. `u"..."` prefix for format strings
+### 2. `_to_sys()` — encode unicode for arcpy function arguments
 
-Python 2 `"...{}...".format(unicode_val)` tries ASCII → `UnicodeEncodeError`.
+arcpy geoprocessing functions (Erase_analysis, Intersect_analysis, Describe, Exists, etc.) may not accept unicode on Chinese Windows.  Encode to system str at every arcpy call boundary.
 
 ```python
-# BROKEN
-arcpy.AddMessage("Field: {}".format(unicode_val))
+# BROKEN — unicode path may cause UnicodeEncodeError inside arcpy
+arcpy.Erase_analysis(unicode_input, unicode_erase, unicode_output)
 
-# CORRECT
-arcpy.AddMessage(u"Field: {}".format(unicode_val))
+# CORRECT — encode at boundary
+arcpy.Erase_analysis(_to_sys(unicode_input), _to_sys(unicode_erase),
+                     _to_sys(unicode_output))
 ```
 
-### 3. `.format()` on string, not function return
+### 3. `_msg()` — encode messages for arcpy UI functions
+
+`arcpy.AddMessage()`, `arcpy.AddError()`, `arcpy.AddWarning()` do NOT accept unicode on ArcGIS 10.2 Chinese Windows.  Always wrap with `_msg()`.
+
+```python
+# BROKEN — unicode in AddMessage triggers UnicodeEncodeError internally
+arcpy.AddMessage(u"Result: {0}".format(name))
+
+# CORRECT — _msg() encodes to system str
+arcpy.AddMessage(_msg(u"Result: {0}".format(name)))
+```
+
+**Rule: every `arcpy.AddMessage/AddError/AddWarning` call goes through `_msg()`.  Every arcpy geoprocessing function argument goes through `_to_sys()` when it may be unicode.**
+
+### 4. `u"..."` prefix for format strings — CRITICAL
+
+Python 2 `str.format(unicode_arg)` internally calls `str(unicode_arg)`, which triggers `unicode.encode(sys.getdefaultencoding())` = `unicode.encode('ascii')` → **UnicodeEncodeError** for any non-ASCII character.
+
+This is a Python 2 language-level behavior, NOT an ArcGIS issue.  It happens BEFORE the string reaches arcpy.
+
+```python
+# BROKEN — str.format(unicode) calls str(unicode) -> encode('ascii')
+arcpy.AddMessage("Field: {0}".format(unicode_val))        # UnicodeEncodeError
+arcpy.AddMessage(_msg("Field: {0}".format(unicode_val)))  # STILL BROKEN
+
+# CORRECT — unicode.format(unicode) works directly with unicode
+arcpy.AddMessage(_msg(u"Field: {0}".format(unicode_val)))
+```
+
+**Deep dive — what actually happens in CPython 2.7:**
+
+When `str.format()` receives any unicode argument, CPython's `string_format` function (in `Objects/stringobject.c`) detects the unicode arg and switches to unicode mode.  For each replacement field `{0}` with no format spec, it calls `PyObject_Str()` on the argument.  `PyObject_Str(unicode_obj)` internally calls `PyUnicode_AsEncodedString(obj, NULL, NULL)`, which uses `sys.getdefaultencoding()` — always `'ascii'` in Python 2.  This is where the `UnicodeEncodeError('ascii', ...)` originates.
+
+**Rule: ALL format strings that may receive unicode arguments MUST use `u"..."` prefix.**
+
+### 5. `.format()` on string, not function return
 
 ```python
 # BROKEN — .format() on AddWarning's None return
@@ -177,7 +271,9 @@ arcpy.AddWarning(u"msg {}".format(x))
 arcpy.AddWarning((u"msg {}").format(x))
 ```
 
-### 4. `updateMessages` must be try-wrapped (.pyt)
+Or safer: use `_msg()` which handles this uniformly.
+
+### 6. `updateMessages` must be try-wrapped (.pyt)
 
 Uncaught exception = silent red X on tool.
 
@@ -190,7 +286,7 @@ def updateMessages(self, parameters):
         pass
 ```
 
-### 5. Validation: don't override altered values
+### 7. Validation: don't override altered values
 
 `parameter.altered` = True if the user changed the value. Only set defaults when `altered` is False.
 
@@ -200,11 +296,11 @@ def updateParameters(self, parameters):
         parameters[1].value = "default_value"
 ```
 
-### 6. Validation: don't set values in `updateMessages`
+### 8. Validation: don't set values in `updateMessages`
 
 Values set in `updateMessages` are NOT validated by internal validation. Set values only in `updateParameters`.
 
-### 7. Validation: don't use catalog-path methods
+### 9. Validation: don't use catalog-path methods
 
 `ListFields`, `ListFeatureClasses` etc. fail when the dataset doesn't exist yet (ModelBuilder validation). Use `arcpy.Describe()` instead.
 
@@ -213,7 +309,7 @@ desc = arcpy.Describe(parameters[0].value)
 field_names = [f.name for f in desc.fields]  # OK in validation
 ```
 
-### 8. Field name safety
+### 10. Field name safety
 
 ArcGIS field names: no leading digit, no special chars beyond `_`. Use `arcpy.ValidateFieldName()`:
 
@@ -227,7 +323,7 @@ if name and name[0] in u"0123456789":
     name = u"_" + name
 ```
 
-### 9. Spatial sorting pattern
+### 11. Spatial sorting pattern
 
 ```python
 # Read: (oid, x, y) tuples via SHAPE@XY
@@ -237,7 +333,7 @@ data.sort(key=lambda t: (-t[2], t[1]))  # Y desc, X asc
 data.sort(key=lambda t: (t[1], -t[4], t[3]))  # (group, -Y, X)
 ```
 
-### 10. Derived output parameters
+### 12. Derived output parameters
 
 For tools that modify input in-place (like Add Field, Calculate Field):
 
@@ -253,42 +349,109 @@ param_out.parameterDependencies = [param_in.name]
 param_out.schema.clone = True
 ```
 
-### 11. `repr(e)` not `str(e)` in exception handlers
+### 13. `repr(e)` not `str(e)` in exception handlers
 
 `str(e)` on UnicodeEncodeError may itself fail. `repr(e)` is always ASCII-safe.
 
-### 12. Environment setup
+### 14. Environment setup
 
 ```python
 arcpy.env.overwriteOutput = True
 arcpy.env.workspace = "in_memory"  # or GDB path
 ```
 
+### 15. finally block — initialize before try
+
+If an exception occurs before a variable is assigned inside `try`, the `finally` block referencing it will get `NameError`.  Initialize ALL cleanup-required variables BEFORE the `try` block.
+
+```python
+# BROKEN — if error before temp_fcs = [], finally raises NameError
+try:
+    ...
+    temp_fcs = []
+    ...
+finally:
+    for fc in temp_fcs:  # NameError!
+
+# CORRECT — init before try
+temp_fcs = []
+try:
+    ...
+finally:
+    for fc in temp_fcs:  # safe
+```
+
+### 16. Encoding strategy summary
+
+```
+                    +-----------+
+  GetParameterAsText |  str/unicode |  raw input
+        |            +-----------+
+        | _to_uni()
+        v
+    unicode  <---- all internal string ops (format, join, basename, split)
+        |
+        | _to_sys() / _msg()
+        v
+    sys str  <---- all arcpy calls (GP functions, AddMessage, AddError)
+```
+
+One golden path: unicode inside, sys str at the boundary.
+
+## .tbx Script Tool Parameter Datatype Selection
+
+ArcGIS 10.2 has known bugs with certain parameter datatypes when dragging SHP files.  Use this guide:
+
+| Scenario | Use | Why |
+|----------|-----|-----|
+| Single input feature (SHP drag needed) | **Feature Layer** | Feature Class has SHP drag-drop bug |
+| Multi input features (SHP drag needed) | **Feature Layer** (multi-value) | Same bug; Feature Layer works |
+| Output workspace path | **Workspace** | Built-in folder/GDB browser |
+| Plain text name | **String** | No selector needed |
+| Numeric input | **Long** / **Double** | Built-in numeric validation |
+
+**Feature Class vs Feature Layer:**
+- Feature Class drag-drop of .shp files: "one or more dropped items are invalid"
+- Feature Layer drag-drop of .shp files: works correctly
+- `GetParameterAsText()` returns the same path string for both types — code is unaffected
+
 ## Common Errors
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Toolbox red X, no error message | UTF-8 Chinese in .pyt source | Remove ALL Chinese; use English or switch to .tbx |
-| `SyntaxError: EOL while scanning string literal` | Chinese bytes misinterpreted as GBK | Remove Chinese from source |
+| `SyntaxError: EOL while scanning string literal` | Chinese bytes misinterpreted as GBK | Remove Chinese from source; use `unichr()` |
+| `SyntaxError: invalid syntax (line N)` | Chinese chars even in comments or u"" literals | Zero Chinese anywhere; use `unichr()` for runtime strings |
 | `UnicodeDecodeError: 'utf8' can't decode byte 0xb1` | GBK str assigned to UpdateCursor | `_to_uni()` before cursor assignment |
-| `UnicodeEncodeError: 'ascii' codec can't encode` | ASCII format string + unicode arg | `u"..."` prefix for format strings |
-| `AttributeError: 'NoneType' has no attribute 'format'` | `.format()` on `AddWarning()` return | Wrap string in parens first |
+| `UnicodeEncodeError: 'ascii' codec can't encode` | `str.format(unicode)` calls `str(unicode)` internally | `u"..."` prefix for ALL format strings that may get unicode args |
+| `UnicodeEncodeError: 'ascii'` despite `u"..."` format | arcpy.AddMessage received unicode | Wrap AddMessage/AddError/AddWarning in `_msg()` |
+| `UnicodeEncodeError: 'ascii'` with `_msg()` used | `str.format()` happened before `_msg()` call | Format string itself must be `u"..."` — happens BEFORE _msg |
+| `AttributeError: 'NoneType' has no attribute 'format'` | `.format()` on `AddWarning()` return | Wrap string in parens first, or use `_msg()` |
 | `ERROR 000310: field name cannot start with digit` | Field name like `123` | Auto-prefix with `_` or use `ValidateFieldName` |
 | `.pyt` red X after parameter changes | Corrupted ArcToolbox.dat cache | Delete `%AppData%\Roaming\ESRI\Desktop10.2\ArcToolbox\ArcToolbox.dat` |
 | Tool silently does nothing | `isLicensed()` returns False | Check license method |
 | Parameter not showing in dialog | `parameterType="Derived"` — Derived params are hidden | Use Required or Optional for visible params |
+| Script changes not taking effect | .tbx caches embedded script | Re-select .py file in tool Properties → Script tab |
+| `NameError` in finally block | Variable defined inside try, error before assignment | Init cleanup vars BEFORE try block |
+| SHP drag-drop: "one or more dropped items invalid" | Feature Class datatype SHP bug | Use Feature Layer datatype instead |
+| `or 'mbcs'` fallback doesn't trigger | `getfilesystemencoding()` returns 'ascii' (truthy) | Explicit check for 'ascii' in encoding guard |
 
 ## Delivery Checklist
 
-1. All source files are pure ASCII (zero Chinese bytes)
-2. All arcpy values go through `_to_uni()` before string ops
-3. All `.format()` calls use `u"..."` when args contain unicode
-4. `updateMessages` is try-wrapped (.pyt)
-5. Field names validated (no leading digit)
-6. `isLicensed()` returns True (or correct license check)
-7. If .tbx: provide parameter table with Chinese UI setup instructions
-8. `repr(e)` used in exception handlers
-9. Environment (`overwriteOutput`, `workspace`) configured
+1. All source files are **pure ASCII** (zero Chinese bytes anywhere)
+2. `sys.getfilesystemencoding()` guard with explicit ASCII check
+3. All arcpy values go through `_to_uni()` before string operations
+4. **ALL** `.format()` calls use `u"..."` when args may contain unicode
+5. **ALL** `arcpy.AddMessage/AddError/AddWarning` calls go through `_msg()`
+6. **ALL** arcpy function args go through `_to_sys()` when they may be unicode paths
+7. Cleanup variables (temp_fcs, etc.) initialized **before** `try` block
+8. `updateMessages` is try-wrapped (.pyt)
+9. Field names validated (no leading digit)
+10. `isLicensed()` returns True (or correct license check)
+11. If .tbx: provide parameter table with Chinese UI setup instructions (GBK README)
+12. `repr(e)` used in exception handlers
+13. Environment (`overwriteOutput`, `workspace`) configured
+14. .tbx parameters: use Feature Layer (not Feature Class) for SHP drag-drop support
 
 ## .tbx Script Tool README Template
 
@@ -319,18 +482,16 @@ When delivering .tbx script tools, always include a setup README (GBK-encoded `.
 
   参数0:
     显示名称: [Chinese label]
-    数据类型: Feature Class（要素类）
+    数据类型: Feature Layer（要素图层）
     参数类型: Required（必填）
     方向: Input（输入）
 
   参数1:
     显示名称: [Chinese label]
-    数据类型: String（字符串）
-    参数类型: Optional（可选）
+    数据类型: Feature Layer（要素图层）
+    参数类型: Required（必填）
     方向: Input（输入）
-    过滤器: 值列表
-      可选值: option_a（说明）
-             option_b（说明）
+    多值: 是
 ```
 
 ### Parameter Config Format
@@ -343,6 +504,7 @@ Each parameter uses key-value pairs, one per line:
   数据类型: <ArcGIS type>（<Chinese name>）
   参数类型: <Required/Optional/Derived>（<Chinese>）
   方向: <Input/Output>（<Chinese>）
+  多值: <是/否>
   过滤器: <Value List / Range / Feature Class / ...>
     可选值: <value>（<note>）
 ```

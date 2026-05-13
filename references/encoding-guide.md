@@ -17,6 +17,152 @@ UTF-8 multi-byte sequences for Chinese characters, when misinterpreted as GBK, p
 | .tbx .py script (external file) | Python's `# coding: utf-8` works for direct imports. But safer to keep pure ASCII. |
 | Messages to user in Chinese | Build at runtime using `unichr()` with hex codepoints (`_w()` helper). |
 | Chinese field values from data | `_to_uni()` converts GBK str to unicode safely. |
+| Passing paths to arcpy functions | `_to_sys()` encodes unicode to system str at boundary. |
+| Sending messages to arcpy UI | `_msg()` encodes unicode to system str for AddMessage/AddError/AddWarning. |
+
+## sys.getfilesystemencoding() Trap
+
+**Critical:** ArcGIS 10.2 embedded Python reports `sys.getfilesystemencoding()` as `'ascii'` (NOT `None`). The common `or 'mbcs'` fallback pattern does NOT work because `'ascii'` is truthy.
+
+```python
+# BROKEN — 'ascii' is truthy, fallback never activates
+_SYS_ENC = sys.getfilesystemencoding() or 'mbcs'  # stays 'ascii'
+
+# CORRECT — explicit check
+_SYS_ENC = sys.getfilesystemencoding()
+if not _SYS_ENC or _SYS_ENC.lower() in ('ascii', 'us-ascii', 'ansi_x3.4-1968'):
+    _SYS_ENC = 'mbcs'
+```
+
+## Python 2 str.format(unicode) — The Hidden Trap
+
+**This is the most insidious encoding bug in ArcGIS 10.2 development.** It happens at the Python 2 language level, BEFORE any arcpy code runs.
+
+### Mechanism
+
+When `str.format()` receives ANY unicode argument, CPython 2.7's `string_format` (in `Objects/stringobject.c`) detects the unicode arg and for each replacement field `{N}` with no format spec, calls `PyObject_Str()` on the argument. `PyObject_Str(unicode_obj)` → `PyUnicode_AsEncodedString(obj, NULL, NULL)` → uses `sys.getdefaultencoding()` which is ALWAYS `'ascii'` in Python 2.
+
+```python
+# This FAILS with UnicodeEncodeError('ascii', ...)
+"    [{0}] {1}".format(1, u'子')  # str.format(unicode)
+#                       ^^^^^^^^^
+# str(u'子') -> u'子'.encode('ascii') -> BOOM
+
+# This WORKS
+u"    [{0}] {1}".format(1, u'子')  # unicode.format(unicode)
+# No str() conversion needed — everything stays unicode
+```
+
+### The Complete Chain (all three levels must be right)
+
+```python
+# Level 1: str.format(unicode) → Python 2 calls str(unicode) → ascii encode → BOOM
+arcpy.AddMessage("Result: {0}".format(unicode_name))        # BROKEN
+
+# Level 2: unicode.format(unicode) → OK, but AddMessage gets unicode → BOOM
+arcpy.AddMessage(u"Result: {0}".format(unicode_name))       # STILL BROKEN
+
+# Level 3: u"" format + _msg() → CORRECT
+arcpy.AddMessage(_msg(u"Result: {0}".format(unicode_name))) # CORRECT
+```
+
+**Level 1 fix**: All format strings that may receive unicode args MUST use `u"..."` prefix.
+**Level 2 fix**: Every `arcpy.AddMessage/AddError/AddWarning` call MUST go through `_msg()`.
+**Level 3 fix**: Every arcpy function arg MUST go through `_to_sys()` when it may be unicode.
+
+## Encoding Boundary Strategy
+
+```
+                    +-----------+
+  GetParameterAsText |  str/unicode |  raw input
+        |            +-----------+
+        | _to_uni()
+        v
+    unicode  <---- all internal string ops (format, join, basename, split, etc.)
+        |
+        | _to_sys() / _msg()
+        v
+    sys str  <---- all arcpy calls (GP functions, AddMessage, AddError, AddWarning)
+```
+
+One golden path: unicode inside, sys str at the boundary.
+
+## Complete Safe String Helpers
+
+```python
+import sys
+
+# Encoding setup (MUST use this guard, not 'or mbcs')
+_SYS_ENC = sys.getfilesystemencoding()
+if not _SYS_ENC or _SYS_ENC.lower() in ('ascii', 'us-ascii', 'ansi_x3.4-1968'):
+    _SYS_ENC = 'mbcs'
+
+
+def _to_uni(val):
+    """Normalize any arcpy value to safe unicode.
+
+    Use for: GetParameterAsText(), cursor field values,
+             any value from arcpy that might be GBK str or unicode.
+    """
+    if val is None:
+        return u""
+    if isinstance(val, unicode):
+        return val
+    if isinstance(val, str):
+        try:
+            return val.decode(_SYS_ENC)  # GBK -> unicode
+        except Exception:
+            try:
+                return val.decode("utf-8")
+            except Exception:
+                return val.decode("utf-8", "replace")
+    return unicode(val)
+
+
+def _to_sys(val):
+    """Encode unicode to system-encoding str for arcpy function arguments.
+
+    Use for: ALL arguments passed to arcpy geoprocessing functions
+             (Erase_analysis, Intersect_analysis, Describe, Exists, etc.)
+    """
+    if isinstance(val, unicode):
+        try:
+            return val.encode(_SYS_ENC)
+        except Exception:
+            return val.encode("utf-8")
+    return str(val) if val is not None else ""
+
+
+def _msg(msg):
+    """Encode message to system-encoding str for arcpy UI functions.
+
+    Use for: EVERY arcpy.AddMessage(), arcpy.AddError(), arcpy.AddWarning() call.
+    The message itself is built with u"..." format strings (unicode),
+    and this function encodes it at the boundary.
+    """
+    if isinstance(msg, unicode):
+        try:
+            return msg.encode(_SYS_ENC)
+        except Exception:
+            return msg.encode("utf-8")
+    return msg if isinstance(msg, str) else str(msg)
+```
+
+### Usage pattern
+
+```python
+# Always: _to_uni at entry
+in_fc = _to_uni(arcpy.GetParameterAsText(0))
+
+# Always: unicode internally, u"" for format strings
+msg = u"Processing: {0} features in {1}".format(count, in_fc)
+
+# Always: _msg() for arcpy UI
+arcpy.AddMessage(_msg(msg))
+
+# Always: _to_sys() for arcpy function args
+arcpy.Erase_analysis(_to_sys(in_fc), _to_sys(erase_fc), _to_sys(out_fc))
+```
 
 ## Safe Unicode Construction
 
@@ -55,31 +201,6 @@ MSG_FAIL  = SHI_BAI + u"：{}"
 # 失败：{}
 MSG_START = _w(0x6B63, 0x5728)  # 正在
 ```
-
-## `_to_uni()` — The Essential Helper
-
-```python
-import sys
-_SYS_ENC = sys.getfilesystemencoding()  # cp936 on Chinese Windows
-
-def _to_uni(val):
-    """Convert anything from arcpy to safe unicode."""
-    if val is None:
-        return u""
-    if isinstance(val, unicode):
-        return val
-    if isinstance(val, str):
-        try:
-            return val.decode(_SYS_ENC)  # GBK → unicode
-        except Exception:
-            return val.decode("utf-8", "replace")  # fallback
-    return unicode(val)
-```
-
-When to use:
-- Wrapping ALL `arcpy.GetParameterAsText()` results
-- Wrapping ALL cursor field values from `SearchCursor`
-- Before any string concatenation or `.format()` involving arcpy data
 
 ## Why `repr(e)` not `str(e)`
 
