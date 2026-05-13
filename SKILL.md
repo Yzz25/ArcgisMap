@@ -290,6 +290,103 @@ arcpy.env.workspace = "in_memory"  # or GDB path
 8. `repr(e)` used in exception handlers
 9. Environment (`overwriteOutput`, `workspace`) configured
 
+## .tbx Script Tool README Template
+
+When delivering .tbx script tools, always include a setup README (GBK-encoded `.txt`) with parameter configuration tables. The README tells the user how to create the .tbx in ArcCatalog and configure each script tool's parameters.
+
+### README Structure
+
+```
+================================================================================
+  [Toolbox Name] — ArcGIS 10.2 Setup Guide
+================================================================================
+
+  ...overview text...
+
+---- Steps in ArcCatalog ----
+
+  1. Open ArcCatalog
+  2. Navigate to [project directory]
+  3. Right-click → New → Toolbox → name it
+  4. Right-click .tbx → Add → Script..., select the .py file
+  5. In the script properties dialog, set each parameter per table below
+
+================================================================================
+  Tool XX: [Chinese Name]
+================================================================================
+
+  脚本文件: ...\scripts\tool_xxx.py
+
+  参数0:
+    显示名称: [Chinese label]
+    数据类型: Feature Class（要素类）
+    参数类型: Required（必填）
+    方向: Input（输入）
+
+  参数1:
+    显示名称: [Chinese label]
+    数据类型: String（字符串）
+    参数类型: Optional（可选）
+    方向: Input（输入）
+    过滤器: 值列表
+      可选值: option_a（说明）
+             option_b（说明）
+```
+
+### Parameter Config Format
+
+Each parameter uses key-value pairs, one per line:
+
+```
+参数N:
+  显示名称: <Chinese UI label>
+  数据类型: <ArcGIS type>（<Chinese name>）
+  参数类型: <Required/Optional/Derived>（<Chinese>）
+  方向: <Input/Output>（<Chinese>）
+  过滤器: <Value List / Range / Feature Class / ...>
+    可选值: <value>（<note>）
+```
+
+Key rule: every DataType/Type/Direction value is followed by its Chinese name in full-width parentheses （）. This lets the user match the ArcCatalog UI exactly.
+
+### ArcGIS Data Type Chinese Names
+
+| DataType | Chinese |
+|----------|---------|
+| Feature Class | 要素类 |
+| Feature Layer | 要素图层 |
+| Table | 表 |
+| Raster Layer | 栅格图层 |
+| String | 字符串 |
+| Long | 长整型 |
+| Double | 双精度 |
+| Boolean | 布尔型 |
+| Workspace | 工作空间 |
+| Field | 字段 |
+| SQL Expression | SQL表达式 |
+
+### Parameter Type Chinese Names
+
+| Type | Chinese |
+|------|---------|
+| Required | 必填 |
+| Optional | 可选 |
+| Derived | 派生 |
+
+### Direction Chinese Names
+
+| Direction | Chinese |
+|-----------|---------|
+| Input | 输入 |
+| Output | 输出 |
+
+### Encoding Note
+
+README must be GBK-encoded for Chinese Windows. After writing with the Write tool (UTF-8), convert with:
+```
+iconv -f UTF-8 -t GBK readme.txt > readme_gbk.txt && mv readme_gbk.txt readme.txt
+```
+
 ## Reference Files
 
 - `references/encoding-guide.md` — GBK/UTF-8 encoding, `unichr()` codepoint table, `_to_uni()` internals
