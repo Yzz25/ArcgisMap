@@ -47,28 +47,22 @@ if not _SYS_ENC or _SYS_ENC.lower() in ('ascii', 'us-ascii', 'ansi_x3.4-1968'):
 | File format | Single .pyt text file | Binary .tbx + separate .py |
 | Chinese UI labels | Chinese `u""` in source → **red X** (encoding conflict) | Set via ArcGIS GUI → safe |
 | Creation | Write file directly | GUI-only (ArcCatalog → Add Script) |
-| Embedding | N/A | Embed .py into .tbx (also reads as GBK!) |
+| Script storage | N/A | .tbx references .py file path (no embedding) |
 | Parameter setup | Code (`getParameterInfo`) | GUI (tedious for many params) |
 | `GPValueTable` + FeatureLayer | **Not supported** (silent red X) | Supported |
 | `isLicensed()` control | Supported | N/A (script tool has no license method) |
-| Debugging red X | Delete `ArcToolbox.dat` cache | Re-embed script |
+| Debugging red X | Delete `ArcToolbox.dat` cache | Verify .py path in tool properties |
 | Distribution | Single file | .tbx + .py pair |
 
 **Decision:**
 - User wants English UI or no UI → .pyt (simplest)
 - User wants Chinese UI → .tbx + .py (GUI setup)
 - User needs `GPValueTable` with FeatureLayer columns → .tbx (required)
-- .py source for .tbx MUST be pure ASCII (same GBK constraint for embedding)
+- .py source for .tbx MUST be pure ASCII (ArcGIS reads .py with system ANSI codepage)
 
 ### .tbx Script Caching Warning
 
-**ArcGIS .tbx embeds a copy of the script content.**  Editing the external .py file does NOT update the tool automatically.  After every edit to the .py file, you MUST re-select it in ArcCatalog:
-
-1. Right-click the tool → Properties → Script tab
-2. Re-browse and select the .py file again
-3. Click OK
-
-A debug `arcpy.AddMessage(...)` at the top of the script helps verify the new version is loaded.
+**ArcGIS .tbx DOES NOT embed the script content.** The .tbx file only references the .py file path. Replacing the .py file on disk is sufficient — no need to re-browse in ArcCatalog. The tool always reads the latest .py from the referenced path at execution time.
 
 ## .pyt Template (from official docs)
 
@@ -431,7 +425,7 @@ ArcGIS 10.2 has known bugs with certain parameter datatypes when dragging SHP fi
 | `.pyt` red X after parameter changes | Corrupted ArcToolbox.dat cache | Delete `%AppData%\Roaming\ESRI\Desktop10.2\ArcToolbox\ArcToolbox.dat` |
 | Tool silently does nothing | `isLicensed()` returns False | Check license method |
 | Parameter not showing in dialog | `parameterType="Derived"` — Derived params are hidden | Use Required or Optional for visible params |
-| Script changes not taking effect | .tbx caches embedded script | Re-select .py file in tool Properties → Script tab |
+| Script changes not taking effect | Old .py cached by Windows file system | Close and reopen ArcCatalog to refresh |
 | `NameError` in finally block | Variable defined inside try, error before assignment | Init cleanup vars BEFORE try block |
 | SHP drag-drop: "one or more dropped items invalid" | Feature Class datatype SHP bug | Use Feature Layer datatype instead |
 | `or 'mbcs'` fallback doesn't trigger | `getfilesystemencoding()` returns 'ascii' (truthy) | Explicit check for 'ascii' in encoding guard |

@@ -4,7 +4,7 @@
 
 ArcGIS 10.2 runs on Python 2.7. On Chinese Windows, the system encoding is GBK (CP936). The Claude Code Write/Edit tools produce UTF-8 files.
 
-When ArcGIS loads a `.pyt` or embedded `.py` script, it reads raw bytes using the system ANSI codepage (GBK). It does NOT respect the `# -*- coding: utf-8 -*-` PEP 263 declaration.
+When ArcGIS loads a `.pyt` file (or a `.py` script through a .tbx tool), it reads raw bytes using the system ANSI codepage (GBK). It does NOT respect the `# -*- coding: utf-8 -*-` PEP 263 declaration.
 
 UTF-8 multi-byte sequences for Chinese characters, when misinterpreted as GBK, produce invalid byte sequences → `SyntaxError`.
 
@@ -13,8 +13,8 @@ UTF-8 multi-byte sequences for Chinese characters, when misinterpreted as GBK, p
 | Scenario | Approach |
 |----------|----------|
 | .pyt with Chinese labels | Label/displayName must be ASCII. User must accept English UI. |
-| .tbx .py script (embedded) | Source must be pure ASCII. Runtime Chinese via `unichr()`. |
-| .tbx .py script (external file) | Python's `# coding: utf-8` works for direct imports. But safer to keep pure ASCII. |
+| .tbx .py script | Source must be pure ASCII. Runtime Chinese via `unichr()`. |
+| .py script (direct run) | Python's `# coding: utf-8` works for direct imports. But safer to keep pure ASCII. |
 | Messages to user in Chinese | Build at runtime using `unichr()` with hex codepoints (`_w()` helper). |
 | Chinese field values from data | `_to_uni()` converts GBK str to unicode safely. |
 | Passing paths to arcpy functions | `_to_sys()` encodes unicode to system str at boundary. |
