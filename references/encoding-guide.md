@@ -206,6 +206,29 @@ MSG_START = _w(0x6B63, 0x5728)  # 正在
 
 `str(e)` on a `UnicodeEncodeError` may itself fail with another encoding error. `repr(e)` always returns ASCII-safe output.
 
+## `str` method vs `unicode` argument — implicit ascii decode
+
+Python 2 `str` methods (`.endswith()`, `.startswith()`, `in` operator, `==`) trigger `str.decode(sys.getdefaultencoding())` when the argument is `unicode`.  `getdefaultencoding()` is ALWAYS `'ascii'` in Python 2.  If the `str` contains GBK bytes, this raises `UnicodeDecodeError`.
+
+```python
+path = u"C:\\新建文件夹\\data.gdb"
+path_str = path.encode('gbk')  # GBK str
+
+# BROKEN — str.endswith(unicode) -> str.decode('ascii') -> BOOM
+path_str.endswith(u".gdb")                 # UnicodeDecodeError('ascii', ...)
+
+# BROKEN — same mechanism
+path_str == u"something"                   # may UnicodeDecodeError
+u"prefix_" + path_str                      # str.decode('ascii') on path_str
+
+# CORRECT — normalize to unicode first
+path_str.decode('gbk').endswith(u".gdb")   # OK
+```
+
+**Rule: never call `str` methods with `unicode` arguments when the `str` may contain non-ASCII bytes.  Normalize to `unicode` first with `_to_uni()`.**
+
+This is distinct from the `str.format(unicode)` trap — same root cause (Python 2 implicit ascii encode/decode), different trigger.
+
 ## GBK Re-Save (Last Resort)
 
 If Chinese in source is unavoidable, the user can:

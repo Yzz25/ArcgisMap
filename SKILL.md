@@ -392,6 +392,147 @@ finally:
 
 One golden path: unicode inside, sys str at the boundary.
 
+### 17. `str` method vs `unicode` argument — implicit ascii decode
+
+Python 2 `str` methods (`.endswith()`, `.startswith()`, `in`, `==`) trigger `str.decode('ascii')` when the argument is `unicode`.  If the `str` contains GBK bytes (e.g. a Chinese path), this raises `UnicodeDecodeError`.
+
+```python
+path = _to_sys(u"C:\\新建\\data.gdb")  # GBK str
+
+# BROKEN — str.endswith(unicode) -> str.decode('ascii') -> BOOM
+path.endswith(u".gdb")                 # UnicodeDecodeError
+
+# CORRECT — normalize to unicode first
+_to_uni(path).endswith(u".gdb")        # OK
+```
+
+**Rule: before comparing/checking a `str` that may contain non-ASCII bytes against `unicode`, normalize with `_to_uni()` first.**
+
+## Personal GDB (.mdb) Pitfalls
+
+Personal GDB uses the Microsoft Jet (Access) database engine. It has three known bugs/limitations that File GDB does not.
+
+### Pitfall 1: Erase fails on Chinese output names
+
+`Erase_analysis` cannot create output feature classes with Chinese names in .mdb.  It fails with "未找到表" (table not found) — a Jet engine error.
+
+**Workaround:** Erase to `in_memory` first, then use `FeatureClassToFeatureClass_conversion` to write the final output.  `FeatureClassToFeatureClass` handles Jet table creation correctly.
+
+```python
+# Always safe — works for .mdb, .gdb, and shapefile
+temp_final = u"in_memory/temp_final_{0}".format(i)
+arcpy.Erase_analysis(input_fc, erase_fc, temp_final)
+if arcpy.Exists(temp_final):
+    arcpy.FeatureClassToFeatureClass_conversion(temp_final, out_ws, out_name)
+else:
+    arcpy.FeatureClassToFeatureClass_conversion(input_fc, out_ws, out_name, "1=0")
+```
+
+### Pitfall 2: CopyFeatures from in_memory corrupts attribute table
+
+`CopyFeatures_management` from `in_memory` to .mdb does not properly initialize Jet internal table structures.  The output appears to work but opening the attribute table fails with "语法错误在查询表达式" (syntax error in query expression).
+
+**Fix:** Use `FeatureClassToFeatureClass_conversion` instead of `CopyFeatures_management` for ALL writes to the output workspace.  `FeatureClassToFeatureClass` validates field names and table structure against the target format.
+
+### Pitfall 3: Non-letter-led field names break Jet SQL
+
+Field names starting with digits (`516515`) or underscores (`_516515`) cause Jet SQL parsing errors.  In Jet, `_` is the single-character LIKE wildcard; digits trigger numeric-literal ambiguity.
+
+**Fix:** Auto-detect and rename problematic fields with `F_` prefix via `FieldMappings`:
+
+```python
+def _write_output(in_features, out_workspace, out_name, where_clause=None):
+    """Write with auto field-name fix for Jet (.mdb / shapefile)."""
+    # File GDB and in_memory don't need Jet fixes
+    out_ws = _to_uni(out_workspace)
+    if out_ws == u"in_memory" or out_ws.lower().endswith(u".gdb"):
+        # Fast path: plain FeatureClassToFeatureClass
+        ...
+        return
+
+    # .mdb / shapefile: build FieldMappings, rename non-letter-led fields
+    fm = arcpy.FieldMappings()
+    for field in arcpy.Describe(in_features).fields:
+        if field.type in ('OID', 'Geometry'):
+            continue
+        fmap = arcpy.FieldMap()
+        fmap.addInputField(in_features, field.name)
+        name = _to_uni(field.name)
+        if name and not (u'A' <= name[0] <= u'Z' or u'a' <= name[0] <= u'z'):
+            out_f = fmap.outputField
+            out_f.name = _to_sys(u"F_" + name)
+            fmap.outputField = out_f
+        fm.addFieldMap(fmap)
+    arcpy.FeatureClassToFeatureClass_conversion(
+        in_features, out_workspace, out_name, field_mapping=fm)
+```
+
+## Empty Geoprocessing Results
+
+ArcGIS geoprocessing tools (Erase, Intersect, Clip, etc.) may **NOT create the output dataset** when the result has zero features.  This is format-dependent: .mdb is especially prone, .gdb less so.
+
+**Rule: always check `arcpy.Exists()` after geoprocessing operations, and provide a schema-only fallback:**
+
+```python
+arcpy.Erase_analysis(in_fc, erase_fc, out_fc)
+if not arcpy.Exists(out_fc):
+    # Erase removed everything — create empty output with same schema
+    arcpy.FeatureClassToFeatureClass_conversion(in_fc, out_ws, out_name, "1=0")
+```
+
+Same pattern applies to `Intersect_analysis`:
+```python
+arcpy.Intersect_analysis([a, b], temp_isect)
+temp_fcs.append(temp_isect)
+if arcpy.Exists(temp_isect):
+    # Intersection has features — save them
+    ...
+else:
+    # No intersection found — skip or create empty placeholder
+    ...
+```
+
+`FeatureClassToFeatureClass_conversion` with `where_clause="1=0"` creates a schema-only copy (zero rows, all fields, correct spatial reference).
+
+## Performance: In-Memory Chain
+
+For multi-step batch operations (A→B→C→D), keep intermediate results in `in_memory` for the processing chain.  Only write to the output workspace for traceability backup.
+
+```python
+# FAST: chain stays in memory
+temp_erase = u"in_memory/temp_erase_{0}".format(i)
+arcpy.Erase_analysis(current_input, erase_fc, temp_erase)
+temp_fcs.append(temp_erase)
+
+# Write to disk ONLY for traceability (not used as next step's input)
+arcpy.FeatureClassToFeatureClass_conversion(temp_erase, out_ws, name)
+
+# Next step reads from memory, not disk
+current_input = temp_erase
+```
+
+This eliminates disk read I/O for every intermediate step — the dominant cost for large datasets.
+
+## `FeatureClassToFeatureClass_conversion` Argument Order
+
+```
+FeatureClassToFeatureClass_conversion(in_features, out_path, out_name,
+                                       {where_clause}, {field_mapping}, {config_keyword})
+```
+
+`field_mapping` is at position **5** (index 4).  When `where_clause` is not needed, you MUST use keyword syntax:
+
+```python
+# BROKEN — FieldMappings object passed as where_clause → ERROR 000623
+arcpy.FeatureClassToFeatureClass_conversion(in_fc, ws, name, fm)
+
+# CORRECT — keyword argument
+arcpy.FeatureClassToFeatureClass_conversion(in_fc, ws, name, field_mapping=fm)
+
+# Also correct — with where_clause, positional works
+arcpy.FeatureClassToFeatureClass_conversion(in_fc, ws, name, "1=0", fm)
+```
+
 ## .tbx Script Tool Parameter Datatype Selection
 
 ArcGIS 10.2 has known bugs with certain parameter datatypes when dragging SHP files.  Use this guide:
@@ -429,6 +570,12 @@ ArcGIS 10.2 has known bugs with certain parameter datatypes when dragging SHP fi
 | `NameError` in finally block | Variable defined inside try, error before assignment | Init cleanup vars BEFORE try block |
 | SHP drag-drop: "one or more dropped items invalid" | Feature Class datatype SHP bug | Use Feature Layer datatype instead |
 | `or 'mbcs'` fallback doesn't trigger | `getfilesystemencoding()` returns 'ascii' (truthy) | Explicit check for 'ascii' in encoding guard |
+| Erase fails: "未找到表" in .mdb | Erase + Chinese output name in Personal GDB | Erase to `in_memory`, then FeatureClassToFeatureClass |
+| "语法错误在查询表达式" opening .mdb attribute table | (a) Used CopyFeatures instead of FeatureClassToFeatureClass; (b) field names start with digit/underscore | Use FeatureClassToFeatureClass; auto-rename fields with `F_` prefix |
+| `ERROR 000623`: value type for where_clause invalid | FieldMappings object passed as positional arg where where_clause expected | Use `field_mapping=fm` keyword argument |
+| `ERROR 000732`: dataset does not exist | Geoprocessing result was empty, output not created | Check `arcpy.Exists()` after each tool; fallback to `FeatureClassToFeatureClass(..., "1=0")` |
+| `UnicodeDecodeError: 'ascii'` in `str.endswith()` | `str.endswith(unicode)` triggers ascii decode on GBK bytes | Normalize with `_to_uni()` before comparing with `unicode` |
+| .mdb attribute table corruption after CopyFeatures | `CopyFeatures_management` from `in_memory` to .mdb skips Jet table init | Use `FeatureClassToFeatureClass_conversion` for all output writes |
 
 ## Delivery Checklist
 
