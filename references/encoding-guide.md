@@ -89,64 +89,13 @@ One golden path: unicode inside, sys str at the boundary.
 
 ## Complete Safe String Helpers
 
-```python
-import sys
+三个函数的**完整可复制实现见 `templates.py`**（脚本工具模板内含编码守卫 + 三函数），写代码时从那里复制，不要重写。
 
-# Encoding setup (MUST use this guard, not 'or mbcs')
-_SYS_ENC = sys.getfilesystemencoding()
-if not _SYS_ENC or _SYS_ENC.lower() in ('ascii', 'us-ascii', 'ansi_x3.4-1968'):
-    _SYS_ENC = 'mbcs'
+- `_to_uni(val)` — arcpy 值（可能是 GBK str 或 unicode）→ 内部 unicode。入口处用。
+- `_to_sys(val)` — unicode → 系统编码 str。传给 arcpy 地理处理函数的路径参数用。
+- `_msg(msg)` — unicode → 系统编码 str。传给 AddMessage/AddError/AddWarning 用。
 
-
-def _to_uni(val):
-    """Normalize any arcpy value to safe unicode.
-
-    Use for: GetParameterAsText(), cursor field values,
-             any value from arcpy that might be GBK str or unicode.
-    """
-    if val is None:
-        return u""
-    if isinstance(val, unicode):
-        return val
-    if isinstance(val, str):
-        try:
-            return val.decode(_SYS_ENC)  # GBK -> unicode
-        except Exception:
-            try:
-                return val.decode("utf-8")
-            except Exception:
-                return val.decode("utf-8", "replace")
-    return unicode(val)
-
-
-def _to_sys(val):
-    """Encode unicode to system-encoding str for arcpy function arguments.
-
-    Use for: ALL arguments passed to arcpy geoprocessing functions
-             (Erase_analysis, Intersect_analysis, Describe, Exists, etc.)
-    """
-    if isinstance(val, unicode):
-        try:
-            return val.encode(_SYS_ENC)
-        except Exception:
-            return val.encode("utf-8")
-    return str(val) if val is not None else ""
-
-
-def _msg(msg):
-    """Encode message to system-encoding str for arcpy UI functions.
-
-    Use for: EVERY arcpy.AddMessage(), arcpy.AddError(), arcpy.AddWarning() call.
-    The message itself is built with u"..." format strings (unicode),
-    and this function encodes it at the boundary.
-    """
-    if isinstance(msg, unicode):
-        try:
-            return msg.encode(_SYS_ENC)
-        except Exception:
-            return msg.encode("utf-8")
-    return msg if isinstance(msg, str) else str(msg)
-```
+编码守卫 `_SYS_ENC` 必须**显式检查 `'ascii'`**，不能只写 `or 'mbcs'`（见上文 Trap）。
 
 ### Usage pattern
 
